@@ -1,2 +1,3 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+                    INCLUDE_DIRS "."
+                    PRIV_REQUIRES bh1750 ssd1306 esp_driver_i2c esp_adc nvs_flash)   
