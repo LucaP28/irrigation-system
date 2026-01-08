@@ -76,9 +76,13 @@ int read_soil_moisture()
     adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &val);
     return val;
 }
+
+
+
+// --- Main ---
 void app_main(void)
 {
-    // 1. NVS, Button, Soil Sensor Init (wie gehabt)
+    // NVS, Button, Soil Sensor Init
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -91,7 +95,7 @@ void app_main(void)
     setup_button();
     setup_soil_sensor();
 
-    // 2. I2C Init
+    // I2C Init
     i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -103,11 +107,11 @@ void app_main(void)
     i2c_param_config(I2C_MASTER_NUM, &i2c_conf);
     i2c_driver_install(I2C_MASTER_NUM, i2c_conf.mode, 0, 0, 0);
 
-    // 3. BH1750 Init
+    // BH1750 Init
     bh1750_dev = bh1750_create(I2C_MASTER_NUM, BH1750_I2C_ADDRESS_DEFAULT);
     bh1750_set_measure_mode(bh1750_dev, BH1750_CONTINUE_1LX_RES);
     
-    // 4. SSD1306 Init
+    // SSD1306 Init
     ssd1306_dev._address = 0x3C;
     ssd1306_init(&ssd1306_dev, 128, 64);
     ssd1306_clear_screen(&ssd1306_dev, false);
@@ -120,8 +124,11 @@ void app_main(void)
         STATE_CAL_EXIT
     } system_state_t;
 
+    // Menu state
     system_state_t current_state = STATE_MONITOR;
     int hold_time = 0;
+
+    float linear_percent = 0.0;
 
     while (1)
     {
@@ -150,7 +157,7 @@ void app_main(void)
             hold_time = 0;
         }
 
-        // Aktion bei langem Druck
+        // Lang drücken: Speichern
         if (hold_time > 20)
         {
             if (current_state == STATE_CAL_DRY)
@@ -178,8 +185,10 @@ void app_main(void)
         // Display Ausgabe
         if (current_state == STATE_MONITOR)
         {
+            // Berechnung von Prozent mit Linearer Interpolation
             int raw = read_soil_moisture();
-            int percent = 0;
+            float percent = 0.0;
+            
             if (g_dry_val != g_wet_val)
             {
                 percent = (g_dry_val - raw) * 100 / (g_dry_val - g_wet_val);
@@ -189,12 +198,14 @@ void app_main(void)
             if (percent > 100)
                 percent = 100;
 
+            linear_percent = (linear_percent * 0.9) + (percent * 0.1);
+
             float lux = 0;
             bh1750_get_data(bh1750_dev, &lux);
 
             char l_str[24], s_str[24];
             sprintf(l_str, "Licht: %.0f lx   ", lux);
-            sprintf(s_str, "Boden: %d %%     ", percent);
+            sprintf(s_str, "Boden: %.1f %%     ", linear_percent);
 
             ssd1306_display_text(&ssd1306_dev, 0, "PFLANZEN-MONITOR", 16, false);
             ssd1306_display_text(&ssd1306_dev, 2, l_str, strlen(l_str), false);
