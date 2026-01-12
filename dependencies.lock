@@ -16,6 +16,6 @@ dependencies:
 direct_dependencies:
 - espressif/bh1750
 - idf
-manifest_hash: ec80a7df647c9ad3780bf14e562365ffa4471404e646972fb18f4f044850f3c6
+manifest_hash: 22cea6199ca79e99148345766eb860deb11ffb1d54937073317d3170450b626b
 target: esp32
 version: 2.0.0

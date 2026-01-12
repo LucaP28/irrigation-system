@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c.h"
@@ -10,10 +11,14 @@
 #include "bh1750.h"
 #include "ssd1306.h"
 #include "driver/gpio.h"
+#include "dht.h"
+
+#define DHT_GPIO 23
+#define DHT_TYPE DHT_TYPE_AM2301
 
 #define BUTTON_GPIO 4
 #define I2C_MASTER_SCL_IO 22
-#define I2C_MASTER_SDA_IO 23
+#define I2C_MASTER_SDA_IO 21
 #define I2C_MASTER_NUM I2C_NUM_0
 
 static const char *TAG = "PLANT_MONITOR";
@@ -22,8 +27,8 @@ bh1750_handle_t bh1750_dev;
 adc_oneshot_unit_handle_t adc1_handle;
 
 // Globale Kalibrierwerte
-int32_t g_dry_val = 2200;
-int32_t g_wet_val = 800;
+int32_t g_dry_val = 2300;
+int32_t g_wet_val = 1000;
 
 // --- NVS FUNKTIONEN ---
 void save_calibration(const char *key, int32_t value)
@@ -77,7 +82,41 @@ int read_soil_moisture()
     return val;
 }
 
+// --- VPD BERECHNUNG ---
+float calculate_VPD(float temp, float hum)
+{
+    if (hum < 0.01)
+        hum = 0.01;                                             // Division durch 0 verhindern
+    float svp = 0.61078 * exp((17.27 * temp) / (temp + 237.3)); // Sättigungsdampfdruck (SVP) in kPa
+    float avp = svp * (hum / 100.0);                            // Aktueller Dampfdruck (AVP)
+    return svp - avp;
+}
 
+// --- DYNAMISCHE ALARM LOGIK ---
+void check_plant_alarm(float soil_pct, float vpd, char *status_out)
+{
+    float threshold = 60.0; // Basis-Schwelle
+
+    if (vpd > 1.5)
+    {
+        threshold = 75.0; // Luft trocken -> früher gießen
+        strcpy(status_out, "DURSTIG (VPD!)");
+    }
+    else if (vpd < 0.5)
+    {
+        threshold = 50.0; // Luft feucht -> später gießen (Schutz vor Fäule)
+        strcpy(status_out, "OK (FEUCHT)");
+    }
+    else
+    {
+        strcpy(status_out, soil_pct < threshold ? "GIESSEN!" : "ALLES GUT");
+    }
+
+    if (soil_pct < threshold)
+    {
+        ESP_LOGW(TAG, "ALARM: Boden %.1f%% zu trocken für VPD %.2f", soil_pct, vpd);
+    }
+}
 
 // --- Main ---
 void app_main(void)
@@ -110,12 +149,13 @@ void app_main(void)
     // BH1750 Init
     bh1750_dev = bh1750_create(I2C_MASTER_NUM, BH1750_I2C_ADDRESS_DEFAULT);
     bh1750_set_measure_mode(bh1750_dev, BH1750_CONTINUE_1LX_RES);
-    
+
     // SSD1306 Init
     ssd1306_dev._address = 0x3C;
     ssd1306_init(&ssd1306_dev, 128, 64);
     ssd1306_clear_screen(&ssd1306_dev, false);
-    
+
+    // Menu state
     typedef enum
     {
         STATE_MONITOR,
@@ -124,14 +164,29 @@ void app_main(void)
         STATE_CAL_EXIT
     } system_state_t;
 
-    // Menu state
     system_state_t current_state = STATE_MONITOR;
     int hold_time = 0;
 
+    // Boden feuchtigkeit linear interpolation
     float linear_percent = 0.0;
+
+    // Luftfeuchtigkeit global
+    float hum = 0;
+    float temp = 0;
+    static int dht_timer = 0;
+
+    vTaskDelay(pdMS_TO_TICKS(2000)); // 2 Sekunden warten, bis alle Sensoren stabil sind
 
     while (1)
     {
+
+        // Sensor auslesen DHT_TYPE_DHT22
+        if (dht_timer++ >= 20)
+        { // Alle 2 Sekunden
+            dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
+            dht_timer = 0;
+        }
+
         int button_level = gpio_get_level(BUTTON_GPIO);
 
         // Button Logik
@@ -157,20 +212,20 @@ void app_main(void)
             hold_time = 0;
         }
 
-        // Lang drücken: Speichern
+        // Lang drücken: save
         if (hold_time > 20)
         {
             if (current_state == STATE_CAL_DRY)
             {
                 g_dry_val = read_soil_moisture();
                 save_calibration("dry", g_dry_val);
-                ssd1306_display_text(&ssd1306_dev, 7, "SAVED DRY!", 10, true);
+                ssd1306_display_text(&ssd1306_dev, 6, "SAVED DRY!", 10, true);
             }
             else if (current_state == STATE_CAL_WET)
             {
                 g_wet_val = read_soil_moisture();
                 save_calibration("wet", g_wet_val);
-                ssd1306_display_text(&ssd1306_dev, 7, "SAVED NASS!", 11, true);
+                ssd1306_display_text(&ssd1306_dev, 6, "SAVED NASS!", 11, true);
             }
 
             if (current_state != STATE_MONITOR)
@@ -182,36 +237,52 @@ void app_main(void)
             }
         }
 
-        // Display Ausgabe
+        // --- DISPLAY AUSGABE ---
         if (current_state == STATE_MONITOR)
         {
-            // Berechnung von Prozent mit Linearer Interpolation
+            // 1. Bodenfeuchtigkeit berechnen
             int raw = read_soil_moisture();
             float percent = 0.0;
-            
             if (g_dry_val != g_wet_val)
             {
-                percent = (g_dry_val - raw) * 100 / (g_dry_val - g_wet_val);
+                percent = (float)(g_dry_val - raw) * 100.0 / (float)(g_dry_val - g_wet_val);
             }
             if (percent < 0)
                 percent = 0;
             if (percent > 100)
                 percent = 100;
 
+            // Glättung des Werts
             linear_percent = (linear_percent * 0.9) + (percent * 0.1);
 
+            // 2. VPD und Alarm berechnen
+            float vpd = calculate_VPD(temp, hum);
+            char status_str[20];
+            check_plant_alarm(linear_percent, vpd, status_str);
+
+            // 3. Licht auslesen
             float lux = 0;
             bh1750_get_data(bh1750_dev, &lux);
 
-            char l_str[24], s_str[24];
-            sprintf(l_str, "Licht: %.0f lx   ", lux);
-            sprintf(s_str, "Boden: %.1f %%     ", linear_percent);
+            // 4. Text-Strings bauen
+            char l_str[24], s_str[24], dht_str[32], vpd_str[24];
+            sprintf(l_str, "Licht: %.0f lx", lux);
+            sprintf(s_str, "Boden: %.1f%%", linear_percent);
+            sprintf(dht_str, "Luft:  %.1fC %.0f%%", temp, hum);
+            sprintf(vpd_str, "VPD:   %.2f kPa", vpd);
 
+            // 5. Display Ausgabe (Zeile 0 bis 7)
             ssd1306_display_text(&ssd1306_dev, 0, "PFLANZEN-MONITOR", 16, false);
             ssd1306_display_text(&ssd1306_dev, 2, l_str, strlen(l_str), false);
-            ssd1306_display_text(&ssd1306_dev, 4, s_str, strlen(s_str), false);
+            ssd1306_display_text(&ssd1306_dev, 3, s_str, strlen(s_str), false);
+            ssd1306_display_text(&ssd1306_dev, 4, dht_str, strlen(dht_str), false);
+            ssd1306_display_text(&ssd1306_dev, 5, vpd_str, strlen(vpd_str), false);
+
+            // Zeile 7: Alarm-Status. Invertiert (true), wenn "GIESSEN!" drinsteht.
+            bool is_alarm = (strcmp(status_str, "GIESSEN!") == 0);
+            ssd1306_display_text(&ssd1306_dev, 7, status_str, strlen(status_str), is_alarm);
         }
-        else
+        else // --- SETUP MENÜ ---
         {
             ssd1306_display_text(&ssd1306_dev, 0, "---- SETUP ----", 13, false);
             char raw_str[24];
@@ -225,22 +296,15 @@ void app_main(void)
             else
                 ssd1306_display_text(&ssd1306_dev, 2, "> ZURUECK      ", 15, false);
 
+            // Fortschrittsanzeige beim Halten
             if (hold_time > 17)
-            {
                 ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save...   ", 15, false);
-            }
             else if (hold_time > 8)
-            {
                 ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save..    ", 15, false);
-            }
             else if (hold_time > 3)
-            { // Ab hier fängt er an zu zählen
                 ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save.     ", 15, false);
-            }
             else
-            {
                 ssd1306_display_text(&ssd1306_dev, 6, "Click: Weiter   ", 15, false);
-            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
