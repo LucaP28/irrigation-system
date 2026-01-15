@@ -14,9 +14,24 @@
 #include "dht.h"
 #include <time.h>
 #include <sys/time.h>
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "mqtt_client.h"
+#include "esp_netif.h"
+#include "secrets.h"
 
-#define DHT_GPIO 23
+// Deine Netzwerk-Daten
+#define MQTT_URI "mqtt://192.168.0.100" // IP des MQTT Servers
+
+static esp_mqtt_client_handle_t mqtt_client;
+
 #define DHT_TYPE DHT_TYPE_AM2301
+#define DHT_GPIO 23
+
+#define RELAY_TRIGGER 1 //0 = High-Level-Trigger : 1 = Low-Level-Trigger)
+#define PUMP_RELAY_GPIO 18
+#define PUMP_DURATION_MS 3000 // 3 Sekunden gießen
+#define PUMP_WAIT_MS 20000    // 20 Sekunden warten (Sickerzeit)
 
 #define BUTTON_GPIO 4
 #define I2C_MASTER_SCL_IO 22
@@ -32,10 +47,12 @@ static const char *TAG = "PLANT_MONITOR";
 SSD1306_t ssd1306_dev;
 bh1750_handle_t bh1750_dev;
 adc_oneshot_unit_handle_t adc1_handle;
+static bool mqtt_started = false;
 
-// Globale Kalibrierwerte
+// Globale Grenzwerte
 int32_t g_dry_val = 2300;
 int32_t g_wet_val = 400;
+float g_pump_threshold = 50.0; // Hardcoded Startwert (50%)
 
 // --- NVS FUNKTIONEN ---
 void save_calibration(const char *key, int32_t value)
@@ -62,7 +79,72 @@ void load_calibration()
     }
 }
 
-// -- TIME FUNKTIONEN ---
+// --- WIFI FUNKTIONEN ---
+
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_URI,
+        .credentials.username = "plant_esp",               // Nutzer
+        .credentials.authentication.password = "apfeltee", // Passwort
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        // Falls das WLAN weg ist, versuchen wir neu zu verbinden
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "Retry connecting to the AP");
+    }
+    // NEU: Erst wenn wir eine IP haben, starten wir MQTT
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "IP erhalten: " IPSTR, IP2STR(&event->ip_info.ip));
+        if (!mqtt_started)
+        {
+            mqtt_app_start();
+            mqtt_started = true;
+        }
+    }
+}
+
+void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    // Registrierung der Events (WLAN-Status + IP-Status)
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+    ESP_LOGI(TAG, "WLAN wird gestartet...");
+    esp_wifi_start();
+}
+
+// --- TIME FUNKTIONEN ---
 void update_light_logic(float current_lux)
 {
     struct timeval tv_now;
@@ -98,6 +180,19 @@ void update_light_logic(float current_lux)
 }
 
 // --- SETUP FUNKTIONEN ---
+void setup_relay()
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PUMP_RELAY_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
+}
+
 void setup_button()
 {
     gpio_config_t io_conf = {
@@ -165,29 +260,56 @@ float calculate_VPD(float temp, float hum)
     return svp - avp;
 }
 
-// --- ALARM ---
-void check_plant_alarm(float soil_pct, float vpd, char *status_out)
+// --- ALARM FUNKTIONEN ---
+bool check_plant_alarm(float soil_pct, float vpd, char *status_out)
 {
-    float threshold = 60.0; // Basis-Schwelle
+    float threshold = g_pump_threshold; 
 
     if (vpd > 1.5)
     {
-        threshold = 75.0; // Luft trocken -> früher gießen
+        threshold += 15.0; // RICHTIG: Addieren
         strcpy(status_out, "DURSTIG (VPD!)");
     }
     else if (vpd < 0.5)
     {
-        threshold = 50.0; // Luft feucht -> später gießen (Schutz vor Fäule)
+        threshold -= 10.0; // RICHTIG: Subtrahieren
         strcpy(status_out, "OK (FEUCHT)");
     }
     else
     {
+        // Text setzen, falls weder hoher noch niedriger VPD
         strcpy(status_out, soil_pct < threshold ? "GIESSEN!" : "ALLES GUT");
     }
 
-    if (soil_pct < threshold)
-    {
-        // ESP_LOGW(TAG, "ALARM: Boden %.1f%% zu trocken für VPD %.2f", soil_pct, vpd);
+    return (soil_pct < threshold);
+}
+
+void control_pump(float current_moisture, float current_vpd) {
+    static uint32_t next_action_time = 0;
+    static int state = 0; 
+    char dummy_status[20]; 
+
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if (now < next_action_time) return;
+
+    if (state == 0) {
+        if (check_plant_alarm(current_moisture, current_vpd, dummy_status)) {
+            ESP_LOGW("PUMPE", "Alarm! Status: %s. Gieße...", dummy_status);
+            gpio_set_level(PUMP_RELAY_GPIO, 1); 
+            state = 1;
+            next_action_time = now + PUMP_DURATION_MS;
+        }
+    }
+    else if (state == 1) {
+        gpio_set_level(PUMP_RELAY_GPIO, 0); 
+        ESP_LOGI("PUMPE", "Gießen beendet. Sickerpause...");
+        state = 2;
+        next_action_time = now + PUMP_WAIT_MS; 
+    } 
+    else if (state == 2) {
+        state = 0; 
+        ESP_LOGI("PUMPE", "Pause vorbei. Messe neu...");
     }
 }
 
@@ -206,6 +328,9 @@ void app_main(void)
     load_calibration();
     setup_button();
     setup_soil_sensor();
+
+    // Networking
+    wifi_init(); // WLAN starten
 
     // Time print
     time_t now;
@@ -321,40 +446,58 @@ void app_main(void)
             }
         }
 
+        // --- SENSOR MESSUNG ---
+        // Bodenfeuchtigkeit berechnen
+        int raw_soil = read_soil_moisture();
+        float percent = 0.0;
+
+        if (g_dry_val != g_wet_val)
+        {
+            percent = (float)(g_dry_val - raw_soil) * 100.0 / (float)(g_dry_val - g_wet_val);
+        }
+        if (percent < 0)
+            percent = 0;
+        if (percent > 100)
+            percent = 100;
+
+        // TDS auswerten
+        int raw_tds = read_tds_raw();
+        int tds = get_tds_value(raw_tds, temp);
+
+        // Glättung des Werts
+        linear_percent = (linear_percent * 0.9) + (percent * 0.1);
+
+        // VPD und Alarm berechnen
+        float vpd = calculate_VPD(temp, hum);
+        char status_str[20];
+        check_plant_alarm(linear_percent, vpd, status_str);
+        
+
+        // Licht auslesen
+        float lux = 0;
+        bh1750_get_data(bh1750_dev, &lux);
+
+        // Update lux time
+        update_light_logic(lux);
+
+        static int mqtt_send_timer = 0;
+        if (mqtt_send_timer++ >= 10)
+        { // Bei 100ms Delay in der Schleife sind 20 = 2 Sekunden
+            char mqtt_payload[128];
+            // Wir bauen das JSON manuell
+            sprintf(mqtt_payload, "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f}",
+                    tds, lux, vpd, linear_percent);
+
+            // Senden an das Topic, das wir in Home Assistant definiert haben
+            esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", mqtt_payload, 0, 1, 0);
+            ESP_LOGI(TAG, "MQTT Sent: %s", mqtt_payload);
+
+            mqtt_send_timer = 0;
+        }
+
         // --- DISPLAY AUSGABE ---
         if (current_state == STATE_MONITOR)
         {
-            // Bodenfeuchtigkeit berechnen
-            int raw_soil = read_soil_moisture();
-            float percent = 0.0;
-
-            if (g_dry_val != g_wet_val)
-            {
-                percent = (float)(g_dry_val - raw_soil) * 100.0 / (float)(g_dry_val - g_wet_val);
-            }
-            if (percent < 0)
-                percent = 0;
-            if (percent > 100)
-                percent = 100;
-
-            // TDS auswerten
-            int raw_tds = read_tds_raw();
-            int tds = get_tds_value(raw_tds, temp);
-
-            // Glättung des Werts
-            linear_percent = (linear_percent * 0.9) + (percent * 0.1);
-
-            // VPD und Alarm berechnen
-            float vpd = calculate_VPD(temp, hum);
-            char status_str[20];
-            check_plant_alarm(linear_percent, vpd, status_str);
-
-            // Licht auslesen
-            float lux = 0;
-            bh1750_get_data(bh1750_dev, &lux);
-
-            // Update lux time
-            update_light_logic(lux);
 
             // Text-Strings bauen
             char l_str[24], s_str[24], dht_str[24], vpd_str[24], tds_str[24], l_sum_str[24];
