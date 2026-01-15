@@ -20,16 +20,14 @@
 #include "esp_netif.h"
 #include "secrets.h"
 
-// Deine Netzwerk-Daten
-#define MQTT_URI "mqtt://192.168.0.100" // IP des MQTT Servers
-
 static esp_mqtt_client_handle_t mqtt_client;
 
 #define DHT_TYPE DHT_TYPE_AM2301
 #define DHT_GPIO 23
 
-#define RELAY_TRIGGER 1 //0 = High-Level-Trigger : 1 = Low-Level-Trigger)
-#define PUMP_RELAY_GPIO 18
+#define RELAY_TRIGGER 0 // 0 = High-Level-Trigger : 1 = Low-Level-Trigger
+#define RELAY_OFF 1     // 1 = High-Level-Trigger : 0 = Low-Level-Trigger
+#define PUMP_RELAY_GPIO 32
 #define PUMP_DURATION_MS 3000 // 3 Sekunden gießen
 #define PUMP_WAIT_MS 20000    // 20 Sekunden warten (Sickerzeit)
 
@@ -53,6 +51,7 @@ static bool mqtt_started = false;
 int32_t g_dry_val = 2300;
 int32_t g_wet_val = 400;
 float g_pump_threshold = 50.0; // Hardcoded Startwert (50%)
+bool g_pump_enabled = false;
 
 // --- NVS FUNKTIONEN ---
 void save_calibration(const char *key, int32_t value)
@@ -85,8 +84,8 @@ static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_URI,
-        .credentials.username = "plant_esp",               // Nutzer
-        .credentials.authentication.password = "apfeltee", // Passwort
+        .credentials.username = MQTT_USER,                // Nutzer
+        .credentials.authentication.password = MQTT_PASS, // Passwort
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_start(mqtt_client);
@@ -184,13 +183,13 @@ void setup_relay()
 {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PUMP_RELAY_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
+        .mode = GPIO_MODE_OUTPUT_OD,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
-    gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
+    gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
 }
 
 void setup_button()
@@ -261,59 +260,56 @@ float calculate_VPD(float temp, float hum)
 }
 
 // --- ALARM FUNKTIONEN ---
-bool check_plant_alarm(float soil_pct, float vpd, char *status_out)
+float get_dynamic_threshold(float threshold, float vpd)
 {
-    float threshold = g_pump_threshold; 
-
+    float vpd_threshold = threshold;
     if (vpd > 1.5)
-    {
-        threshold += 15.0; // RICHTIG: Addieren
-        strcpy(status_out, "DURSTIG (VPD!)");
-    }
+        vpd_threshold += 15.0;
     else if (vpd < 0.5)
-    {
-        threshold -= 10.0; // RICHTIG: Subtrahieren
-        strcpy(status_out, "OK (FEUCHT)");
-    }
-    else
-    {
-        // Text setzen, falls weder hoher noch niedriger VPD
-        strcpy(status_out, soil_pct < threshold ? "GIESSEN!" : "ALLES GUT");
-    }
-
-    return (soil_pct < threshold);
+        vpd_threshold -= 10.0;
+    return vpd_threshold;
 }
 
-void control_pump(float current_moisture, float current_vpd) {
-    static uint32_t next_action_time = 0;
-    static int state = 0; 
-    char dummy_status[20]; 
+void control_pump(bool threshold)
+{
+    // Wenn Pumpe deaktiviert, immer aus machen und Funktion verlassen
+    if (!g_pump_enabled)
+    {
+        gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
+        return;
+    }
 
+    static uint32_t next_action_time = 0;
+    static int state = 0;
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    if (now < next_action_time) return;
+    if (now < next_action_time)
+    {
+        return;
+    }
 
-    if (state == 0) {
-        if (check_plant_alarm(current_moisture, current_vpd, dummy_status)) {
-            ESP_LOGW("PUMPE", "Alarm! Status: %s. Gieße...", dummy_status);
-            gpio_set_level(PUMP_RELAY_GPIO, 1); 
+    if (state == 0)
+    { // Messen
+        if (threshold)
+        {
+            gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER); // Low-Level: 0 ist AN
             state = 1;
             next_action_time = now + PUMP_DURATION_MS;
         }
     }
-    else if (state == 1) {
-        gpio_set_level(PUMP_RELAY_GPIO, 0); 
-        ESP_LOGI("PUMPE", "Gießen beendet. Sickerpause...");
+    else if (state == 1)
+    {                                               // Gießen fertig
+        gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF); // Low-Level: 1 ist AUS
         state = 2;
-        next_action_time = now + PUMP_WAIT_MS; 
-    } 
-    else if (state == 2) {
-        state = 0; 
-        ESP_LOGI("PUMPE", "Pause vorbei. Messe neu...");
+        next_action_time = now + PUMP_WAIT_MS;
+    }
+    else if (state == 2)
+    { // Sickerpause vorbei
+        state = 0;
     }
 }
 
-// --- Main ---
+// --------------------------- Main -----------------------------
 void app_main(void)
 {
     // NVS, Button, Soil Sensor Init
@@ -328,6 +324,7 @@ void app_main(void)
     load_calibration();
     setup_button();
     setup_soil_sensor();
+    setup_relay();
 
     // Networking
     wifi_init(); // WLAN starten
@@ -371,6 +368,7 @@ void app_main(void)
         STATE_MONITOR,
         STATE_CAL_DRY,
         STATE_CAL_WET,
+        STATE_PUMP_TOGGLE,
         STATE_CAL_EXIT
     } system_state_t;
 
@@ -387,18 +385,17 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(2000)); // 2 Sekunden warten, bis alle Sensoren stabil sind
 
+
+
+
+
+    // ------------------------- WHILE LOOP -----------------------------------
+
     while (1)
     {
-        // Sensor auslesen DHT_TYPE_DHT22
-        if (dht_timer++ >= 20)
-        { // Alle 2 Sekunden
-            dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
-            dht_timer = 0;
-        }
-
+        // ---------------------- Button Logik -----------------------------------
         int button_level = gpio_get_level(BUTTON_GPIO);
 
-        // Button Logik
         if (button_level == 0)
         {
             hold_time++;
@@ -414,6 +411,7 @@ void app_main(void)
                 }
                 else
                 {
+                    // Schaltet jetzt durch DRY -> WET -> PUMP_TOGGLE -> EXIT
                     current_state = (current_state == STATE_CAL_EXIT) ? STATE_CAL_DRY : (current_state + 1);
                 }
                 ssd1306_clear_screen(&ssd1306_dev, false);
@@ -421,23 +419,45 @@ void app_main(void)
             hold_time = 0;
         }
 
-        // Lang drücken: save
+
+
+
+
+
+        // --------------------- BUTTON HOLD LOGIK --------------------------
         if (hold_time > 12)
         {
+            bool state_changed = false;
+
             if (current_state == STATE_CAL_DRY)
             {
                 g_dry_val = read_soil_moisture();
                 save_calibration("dry", g_dry_val);
                 ssd1306_display_text(&ssd1306_dev, 6, "SAVED DRY!", 10, true);
+                state_changed = true;
             }
             else if (current_state == STATE_CAL_WET)
             {
                 g_wet_val = read_soil_moisture();
                 save_calibration("wet", g_wet_val);
                 ssd1306_display_text(&ssd1306_dev, 6, "SAVED NASS!", 11, true);
+                state_changed = true;
+            }
+            else if (current_state == STATE_PUMP_TOGGLE)
+            {
+                g_pump_enabled = !g_pump_enabled; // Umschalten
+                char *msg = g_pump_enabled ? "PUMPE AN!" : "PUMPE AUS!";
+                ssd1306_display_text(&ssd1306_dev, 6, msg, strlen(msg), true);
+                state_changed = true;
+            }
+            else if (current_state == STATE_CAL_EXIT)
+            {
+                char *msg = "EXIT!";
+                ssd1306_display_text(&ssd1306_dev, 6, msg, strlen(msg), true);
+                state_changed = true;
             }
 
-            if (current_state != STATE_MONITOR)
+            if (state_changed)
             {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 current_state = STATE_MONITOR;
@@ -446,7 +466,18 @@ void app_main(void)
             }
         }
 
-        // --- SENSOR MESSUNG ---
+
+
+
+
+        // ----------------------- SENSOR MESSUNG ------------------------------------
+        // Sensor auslesen DHT_TYPE_DHT22
+        if (dht_timer++ >= 20)
+        { // Nur Alle 2 Sekunden sonst wird der sensor zu heiß
+            dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
+            dht_timer = 0;
+        }
+
         // Bodenfeuchtigkeit berechnen
         int raw_soil = read_soil_moisture();
         float percent = 0.0;
@@ -469,9 +500,11 @@ void app_main(void)
 
         // VPD und Alarm berechnen
         float vpd = calculate_VPD(temp, hum);
-        char status_str[20];
-        check_plant_alarm(linear_percent, vpd, status_str);
-        
+        float current_target = get_dynamic_threshold(g_pump_threshold, vpd);
+        bool is_too_dry = (linear_percent < current_target); // returns true if its to dry in relation to humidity
+
+        // Pumpe steuern
+        control_pump(is_too_dry);
 
         // Licht auslesen
         float lux = 0;
@@ -495,56 +528,78 @@ void app_main(void)
             mqtt_send_timer = 0;
         }
 
-        // --- DISPLAY AUSGABE ---
+
+
+
+
+        // --------------------- DISPLAY AUSGABE -----------------------------
         if (current_state == STATE_MONITOR)
         {
 
             // Text-Strings bauen
             char l_str[24], s_str[24], dht_str[24], vpd_str[24], tds_str[24], l_sum_str[24];
             ;
-            sprintf(l_str, "Licht: %.0f lx   ", lux);
-            sprintf(s_str, "Boden: %.1f%%   ", linear_percent);
-            sprintf(dht_str, "Luft: %.1fC %.0f%%   ", temp, hum);
-            sprintf(vpd_str, "VPD: %.2f kPa   ", vpd);
-            sprintf(tds_str, "TDS: %i ppm   ", tds);
-            sprintf(l_sum_str, "Sonne: %.0f lx/H", g_lxh_total);
+            sprintf(l_str, "Licht:   %.0f lx   ", lux);
+            sprintf(s_str, "Boden:      %.1f%%   ", linear_percent);
+            sprintf(dht_str, "Luft:  %.1fC %.0f%%   ", temp, hum);
+            sprintf(vpd_str, "VPD:    %.2f kPa   ", vpd);
+            sprintf(tds_str, "TDS:    %i ppm   ", tds);
+            sprintf(l_sum_str, "Sonne:  %.0f lx/H", g_lxh_total);
 
             // 5. Display Ausgabe (Zeile 0 bis 7)
-            ssd1306_display_text(&ssd1306_dev, 0, "PFLANZEN-MONITOR", 16, false);
-            ssd1306_display_text(&ssd1306_dev, 1, l_str, strlen(l_str), false);
-            ssd1306_display_text(&ssd1306_dev, 2, s_str, strlen(s_str), false);
-            ssd1306_display_text(&ssd1306_dev, 3, dht_str, strlen(dht_str), false);
-            ssd1306_display_text(&ssd1306_dev, 4, vpd_str, strlen(vpd_str), false);
-            ssd1306_display_text(&ssd1306_dev, 5, tds_str, strlen(tds_str), false);
-            ssd1306_display_text(&ssd1306_dev, 6, l_sum_str, strlen(l_sum_str), false);
+            //ssd1306_display_text(&ssd1306_dev, 0, "PFLANZEN-MONITOR", 16, false);
+            ssd1306_display_text(&ssd1306_dev, 0, l_str, strlen(l_str), false);
+            ssd1306_display_text(&ssd1306_dev, 1, s_str, strlen(s_str), false);
+            ssd1306_display_text(&ssd1306_dev, 2, dht_str, strlen(dht_str), false);
+            ssd1306_display_text(&ssd1306_dev, 3, vpd_str, strlen(vpd_str), false);
+            ssd1306_display_text(&ssd1306_dev, 4, tds_str, strlen(tds_str), false);
+            ssd1306_display_text(&ssd1306_dev, 5, l_sum_str, strlen(l_sum_str), false);
 
             // Alarm-Status. Invertiert, wenn "GIESSEN!" drinsteht.
-            bool is_alarm = (strcmp(status_str, "GIESSEN!") == 0);
-            ssd1306_display_text(&ssd1306_dev, 7, status_str, strlen(status_str), is_alarm);
+            char *display_status = is_too_dry ? "GIESSEN!     " : "ALLES GUT     ";
+            if (vpd > 1.5 && is_too_dry)
+            {
+                display_status = "TO DRY (VPD!)";
+            }
+            // Display Alarm
+            ssd1306_display_text(&ssd1306_dev, 7, display_status, strlen(display_status), !(is_too_dry && g_pump_enabled));
         }
         else // --- SETUP MENÜ ---
         {
             ssd1306_display_text(&ssd1306_dev, 0, "---- SETUP ----", 13, false);
+            
             char raw_str[24];
             sprintf(raw_str, "RAW: %d      ", read_soil_moisture());
-            ssd1306_display_text(&ssd1306_dev, 4, raw_str, strlen(raw_str), false);
+            
 
-            if (current_state == STATE_CAL_DRY)
+            // Hier wird jetzt jeder Status korrekt angezeigt
+            if (current_state == STATE_CAL_DRY) {
                 ssd1306_display_text(&ssd1306_dev, 2, "> Set: TROCKEN   ", 15, false);
-            else if (current_state == STATE_CAL_WET)
-                ssd1306_display_text(&ssd1306_dev, 2, "> Set: NASS   ", 15, false);
-            else
-                ssd1306_display_text(&ssd1306_dev, 2, "> ZURUECK      ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 4, raw_str, strlen(raw_str), false);
+            } 
+            else if (current_state == STATE_CAL_WET) {
+                ssd1306_display_text(&ssd1306_dev, 2, "> Set: NASS      ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 4, raw_str, strlen(raw_str), false);
+            } 
+            else if (current_state == STATE_PUMP_TOGGLE) {
+                // NEU: Zeigt an, ob die Pumpe gerade aktiviert ist oder nicht
+                char p_str[24];
+                sprintf(p_str, "> PUMPE: %s   ", g_pump_enabled ? "AN " : "AUS");
+                ssd1306_display_text(&ssd1306_dev, 2, p_str, strlen(p_str), false);
+            } 
+            else if (current_state == STATE_CAL_EXIT) {
+                ssd1306_display_text(&ssd1306_dev, 2, "> ZURUECK       ", 15, false);
+            }
 
-            // Fortschrittsanzeige beim Halten
+            // Fortschrittsanzeige beim Halten (unverändert)
             if (hold_time > 9)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save...   ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion...  ", 15, false);
             else if (hold_time > 6)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save..    ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion..   ", 15, false);
             else if (hold_time > 3)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Save.     ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion.    ", 15, false);
             else
-                ssd1306_display_text(&ssd1306_dev, 6, "Click: Weiter   ", 15, false);
+                ssd1306_display_text(&ssd1306_dev, 6, "Click: Weiter    ", 15, false);
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
