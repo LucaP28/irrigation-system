@@ -47,6 +47,7 @@ static RTC_DATA_ATTR float g_lxh_total = 0;     // Licht-Summe
 static RTC_DATA_ATTR long g_last_timestamp = 0; // Letzter Messzeitpunkt
 static RTC_DATA_ATTR int g_last_day = -1;       // Zur Erkennung des Datumswechsels
 static bool g_lxh_synced = false;               // Die gesammelten Lux/h von homeassitant ziehen, bei strom ausfall
+static bool g_dry_run_alarm = false;            // Alarm wenn Wasser fehlt oder Pumpe defekt
 #define MQTT_TOPIC_SYNC_LXH "home/plants/basilikum/sync_lxh"
 
 static const char *TAG = "PLANT_MONITOR";
@@ -131,6 +132,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT verbunden! Abonniere Topics...");
         esp_mqtt_client_subscribe(client, "home/plants/basilikum/set_threshold", 0);
         esp_mqtt_client_subscribe(client, MQTT_TOPIC_SYNC_LXH, 0);
+        
+        // Fordere HA aktiv auf, den gespeicherten Wert zu senden
+        // esp_mqtt_client_publish(client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
         break;
 
     case MQTT_EVENT_DATA:
@@ -146,13 +150,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (new_val >= 0 && new_val <= 100)
             {
                 g_pump_threshold = new_val;
-                save_calibration("threshold", (int32_t)g_pump_threshold); // in den nvs speichern
+                save_calibration("threshold", (int32_t)g_pump_threshold);
                 ESP_LOGW(TAG, "MQTT: g_pump_threshold auf %d gesetzt", g_pump_threshold);
             }
         }
         // --- LXH Sync ---
         else if (strncmp(event->topic, MQTT_TOPIC_SYNC_LXH, event->topic_len) == 0)
         {
+            // verarbeitet das Sync-Paket nur, wenn wir noch nicht synchronisiert sind
             if (!g_lxh_synced)
             {
                 char data_buf[64];
@@ -163,13 +168,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 float restored_val = 0;
                 int restored_day = -1;
 
-                if (sscanf(data_buf, "{\"val\": %f, \"day\": %d}", &restored_val, &restored_day) >= 1)
+                if (sscanf(data_buf, "{\"val\": %f, \"day\": %d}", &restored_val, &restored_day) == 2)
                 {
                     time_t now;
                     time(&now);
 
-                    // verarbeitet das Paket nur, wenn wir echte Zeit haben (> Jahr 2024)
-                    if (now > 1704067200) 
+                    // Prüfe auf valide Zeit (> Jahr 2001), da dein SNTP 2004 liefert
+                    if (now > 1000000000) 
                     {
                         struct tm timeinfo;
                         localtime_r(&now, &timeinfo);
@@ -177,23 +182,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         if (timeinfo.tm_mday == restored_day)
                         {
                             g_lxh_total = restored_val;
-                            ESP_LOGW(TAG, "Sync: Wert von HEUTE geladen (%.1f)", g_lxh_total);
+                            g_lxh_synced = true; 
+                            ESP_LOGW(TAG, "Sync: Wert von HEUTE erfolgreich geladen (%.1f)", g_lxh_total);
                         }
                         else
                         {
                             g_lxh_total = 0;
-                            ESP_LOGW(TAG, "Sync: Wert war von GESTERN (Tag %d, heute %d). Reset.", restored_day, timeinfo.tm_mday);
+                            g_lxh_synced = true;
+                            ESP_LOGW(TAG, "Sync: Paket war von GESTERN (Tag %d, heute %d). Reset auf 0.", restored_day, timeinfo.tm_mday);
                         }
-                        g_lxh_synced = true; // Jetzt ist der Sync abgeschlossen
                     }
                     else 
                     {
-                        // Wir haben noch keine Internet, wir tun so, als hätten wir das Paket nie gesehen...
-                        ESP_LOGI(TAG, "Sync-Paket ignoriert, warte auf SNTP-Zeit...");
+                        // Wartet auf das nächste Paket, damit wir nicht versehentlich 0 speichern.
+                        ESP_LOGI(TAG, "Sync-Paket erhalten, aber SNTP-Zeit noch nicht bereit. Ignoriere...");
                     }
                 }
             }
-        
         }
         break;
 
@@ -267,15 +272,17 @@ void wifi_init(void)
     esp_wifi_start();
 }
 
-void mqtt_publish_data(int tds, float lux, float vpd, float moisture, float lxh, bool fert_alarm)
-{
-    if (!mqtt_initialized)
-        return;
-
-    char payload[256]; // Buffer groß genug wählen
+void mqtt_publish_data(int tds, float lux, float vpd, float moisture, float lxh, bool fert_alarm, bool dry_run_alarm)
+{   
+    // wartet den ersten light sync von homeassistant ab, bis es was senden darf
+    if (!mqtt_initialized || !g_lxh_synced) {
+        return; 
+    }
+    
+    char payload[256]; // Buffer auf 256 erhöht, da das JSON länger wird
     snprintf(payload, sizeof(payload),
-             "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %d, \"lxh\": %.1f, \"fert_alarm\": %d}",
-             tds, lux, vpd, moisture, g_pump_threshold, lxh, (fert_alarm ? 1 : 0));
+             "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %d, \"lxh\": %.1f, \"fert_alarm\": %d, \"dry_run\": %d}",
+             tds, lux, vpd, moisture, g_pump_threshold, lxh, (fert_alarm ? 1 : 0), (dry_run_alarm ? 1 : 0));
 
     esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", payload, 0, 1, 0);
     ESP_LOGI(TAG, "MQTT Sent: %s", payload);
@@ -305,16 +312,22 @@ void manage_sntp_sync()
     struct timeval tv_now;
     gettimeofday(&tv_now, NULL);
     time_t now = tv_now.tv_sec;
+ 
+    // nutzt 1000000000 (Jahr 2001), da der Server 2004 liefert.
+    bool current_sync_status = (now > 1000000000);
 
-    // Aktueller Status: Ist die Zeit valide (Jahr > 2024)?
-    bool current_sync_status = (now > 1704067200);
-
-    // --- LOGGING (Nur bei Statusänderung, um Spam zu vermeiden) ---
+    // --- LOGGING & SYNC TRIGGER ---
     if (current_sync_status != time_is_synchronized)
     {
         if (current_sync_status)
         {
             ESP_LOGW(TAG, ">>> Zeit erfolgreich synchronisiert! (Unix: %ld)", now);
+            
+            // Sobald die Zeit da ist, fordert den Lux-Wert aktiv an, falls wir noch nicht synchronisiert sind.
+            if (!g_lxh_synced && mqtt_initialized) {
+                ESP_LOGW(TAG, "Zeit steht bereit. Fordere lxH Sync von HA an...");
+                esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
+            }
         }
         else
         {
@@ -326,22 +339,20 @@ void manage_sntp_sync()
     // --- SYNC LOGIK ---
     if (!current_sync_status)
     {
-        // Noch auf 1970: Alle 10 Sekunden neu versuchen
+        // Alle 10 Sekunden neu versuchen, bis wir eine Zeit haben
         if (now - last_sntp_request > 10 || last_sntp_request == 0)
         {
-            ESP_LOGI(TAG, "Sende SNTP-Anfrage (Modus: POLL)...");
-
-            esp_sntp_stop();                             // Dienst stoppen für sauberen Re-Init
-            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL); // SNTP für weniger Overhead
-            esp_sntp_setservername(0, "pool.ntp.org");   // Weltweiter Pool
-            esp_sntp_init();                             // Neustart
-
+            ESP_LOGI(TAG, "Sende SNTP-Anfrage...");
+            esp_sntp_stop();
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_init();
             last_sntp_request = now;
         }
     }
     else
     {
-        // Zeit ist da: Alle 12 Stunden einen Re-Sync zur Drift-Korrektur
+        // Alle 12 Stunden Re-Sync
         if (now - last_sntp_request > 43200)
         {
             ESP_LOGI(TAG, "Geplanter 12h SNTP Re-Sync...");
@@ -396,9 +407,10 @@ void update_light_logic(float current_lux)
         g_last_day = timeinfo.tm_mday; // Neuen Tag merken
 
         // Sofort an HA schicken, damit der Speicher dort auch auf 0 geht
-        mqtt_publish_data(0, current_lux, 0, 0, g_lxh_total, false);
+        mqtt_publish_data(0, current_lux, 0, 0, g_lxh_total, false, false);
     }
 }
+
 // --- SETUP FUNKTIONEN ---
 void setup_relay()
 {
@@ -491,9 +503,8 @@ int get_dynamic_threshold(int threshold, float vpd)
     return vpd_threshold;
 }
 
-void control_pump(bool threshold)
+void control_pump(bool threshold, float current_moisture)
 {
-    // Wenn Pumpe deaktiviert, immer aus machen und Funktion verlassen
     if (!g_pump_enabled)
     {
         gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
@@ -502,34 +513,51 @@ void control_pump(bool threshold)
 
     static uint32_t next_action_time = 0;
     static int state = 0;
+    static float moisture_at_start = 0.0;
+    static int retry_count = 0; // Zähler für erfolglose Gießversuche
+    
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    if (now < next_action_time)
-    {
-        return;
-    }
+    if (now < next_action_time) return;
 
-    if (state == 0)
-    { // Messen
-        if (threshold)
-        {
-            gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER); // Low-Level: 0 ist AN
-            state = 1;
-            next_action_time = now + PUMP_DURATION_MS;
-        }
-    }
-    else if (state == 1)
-    {                                               // Gießen fertig
-        gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF); // Low-Level: 1 ist AUS
-        state = 2;
-        next_action_time = now + PUMP_WAIT_MS;
-    }
-    else if (state == 2)
-    { // Sickerpause vorbei
-        state = 0;
+    switch (state) {
+        case 0: // Warten
+            if (threshold) {
+                moisture_at_start = current_moisture;
+                gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
+                state = 1;
+                next_action_time = now + PUMP_DURATION_MS;
+                ESP_LOGI(TAG, "Gießversuch gestartet (Versuch %d/3). Feuchte: %.1f%%", retry_count + 1, moisture_at_start);
+            }
+            break;
+
+        case 1: // Gießen beendet
+            gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
+            state = 2;
+            next_action_time = now + PUMP_WAIT_MS; // Sickerpause
+            break;
+
+        case 2: // Erfolgskontrolle nach Sickerpause
+            if (current_moisture < (moisture_at_start + 0.5f)) {
+                // Zähler hoch
+                retry_count++;
+                ESP_LOGW(TAG, "Keine Feuchtigkeitsänderung erkannt (%d/3)", retry_count);
+                
+                if (retry_count >= 3) {
+                    g_dry_run_alarm = true;
+                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM nach 3 Versuchen !!!");
+                    g_pump_enabled = false; // Pumpe komplett sperren
+                }
+            } else {
+                // Zähler zurücksetzen
+                retry_count = 0;
+                g_dry_run_alarm = false;
+                ESP_LOGI(TAG, "Gießen erfolgreich. Zähler zurückgesetzt.");
+            }
+            state = 0;
+            break;
     }
 }
-
 bool fertilizer_alarm(float tdsValue, float moisture)
 {
     if (tdsValue > 50 && moisture > 20.0)
@@ -730,7 +758,7 @@ void app_main(void)
         bool is_too_dry = (linear_wet < current_target); // returns true if its to dry in relation to humidity
 
         // Pumpe steuern
-        control_pump(is_too_dry);
+        control_pump(is_too_dry, linear_wet);
 
         // Licht auslesen
         float lux = 0;
@@ -743,7 +771,7 @@ void app_main(void)
         static int mqtt_timer = 0;
         if (mqtt_timer++ >= 20)
         {
-            mqtt_publish_data(tds, lux, vpd, linear_wet, g_lxh_total, fertilizer_alarm(tds, linear_wet));
+            mqtt_publish_data(tds, lux, vpd, linear_wet, g_lxh_total, fertilizer_alarm(tds, linear_wet), g_dry_run_alarm);
             mqtt_timer = 0;
         }
 
