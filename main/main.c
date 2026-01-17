@@ -704,6 +704,7 @@ void app_main(void)
             else if (current_state == STATE_PUMP_TOGGLE)
             {
                 g_pump_enabled = !g_pump_enabled; // Umschalten
+                g_dry_run_alarm = false;          // Alarm im HA aus machen
                 char *msg = g_pump_enabled ? "PUMPE AN!" : "PUMPE AUS!";
                 ssd1306_display_text(&ssd1306_dev, 6, msg, strlen(msg), true);
                 state_changed = true;
