@@ -26,11 +26,11 @@ static esp_mqtt_client_handle_t mqtt_client;
 #define DHT_TYPE DHT_TYPE_AM2301
 #define DHT_GPIO 23
 
-#define RELAY_TRIGGER 0 // 0 = High-Level-Trigger : 1 = Low-Level-Trigger
-#define RELAY_OFF 1     // 1 = High-Level-Trigger : 0 = Low-Level-Trigger
+#define RELAY_TRIGGER 0 // 1 = High-Level-Trigger : 0 = Low-Level-Trigger
+#define RELAY_OFF 1     // 0 = High-Level-Trigger : 1 = Low-Level-Trigger
 #define PUMP_RELAY_GPIO 32
-#define PUMP_DURATION_MS 2000 // 2 Sekunden gießen
-#define PUMP_WAIT_MS 20000    // 20 Sekunden warten (testweise, später um die 2 minuten)
+#define PUMP_DURATION_MS 4000 // 4 Sekunden gießen
+#define PUMP_WAIT_MS 240000    // 240 Sekunden warten
 
 #define BUTTON_GPIO 4
 #define I2C_MASTER_SCL_IO 22
@@ -46,8 +46,9 @@ static esp_mqtt_client_handle_t mqtt_client;
 static RTC_DATA_ATTR float g_lxh_total = 0;     // Licht-Summe
 static RTC_DATA_ATTR long g_last_timestamp = 0; // Letzter Messzeitpunkt
 static RTC_DATA_ATTR int g_last_day = -1;       // Zur Erkennung des Datumswechsels
+static RTC_DATA_ATTR bool g_dry_run_alarm = false;            // Alarm wenn Wasser fehlt oder Pumpe defekt
+
 static bool g_lxh_synced = false;               // Die gesammelten Lux/h von homeassitant ziehen, bei strom ausfall
-static bool g_dry_run_alarm = false;            // Alarm wenn Wasser fehlt oder Pumpe defekt
 #define MQTT_TOPIC_SYNC_LXH "home/plants/basilikum/sync_lxh"
 
 static const char *TAG = "PLANT_MONITOR";
@@ -61,7 +62,7 @@ static bool time_is_synchronized = false;
 // Globale Grenzwerte
 int32_t g_dry_val = 2300;
 int32_t g_wet_val = 400;
-int g_pump_threshold = 50; // Hardcoded Startwert (50%)
+int32_t g_pump_threshold = 50; // Hardcoded Startwert (50%)
 bool g_pump_enabled = false;
 
 // --- NVS FUNKTIONEN ---
@@ -115,8 +116,9 @@ void load_calibration()
     {
         nvs_get_i32(my_handle, "dry", &g_dry_val);
         nvs_get_i32(my_handle, "wet", &g_wet_val);
+        nvs_get_i32(my_handle, "threshold", &g_pump_threshold);
         nvs_close(my_handle);
-        ESP_LOGI(TAG, "Geladen: Dry=%ld, Wet=%ld", g_dry_val, g_wet_val);
+        ESP_LOGI(TAG, "Geladen: Dry=%ld, Wet=%ld, Pump-Threshold=%ld", g_dry_val, g_wet_val, g_pump_threshold);
     }
 }
 
@@ -131,10 +133,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT verbunden! Abonniere Topics...");
         esp_mqtt_client_subscribe(client, "home/plants/basilikum/set_threshold", 0);
+        esp_mqtt_client_subscribe(client, "home/plants/basilikum/set_pump_enabled", 0);
         esp_mqtt_client_subscribe(client, MQTT_TOPIC_SYNC_LXH, 0);
         
-        // Fordere HA aktiv auf, den gespeicherten Wert zu senden
-        // esp_mqtt_client_publish(client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
+        // get pump state retained from HA
+        esp_mqtt_client_publish(client, "home/plants/basilikum/state_pump_enabled", 
+                       g_pump_enabled ? "1" : "0", 0, 1, 1);
         break;
 
     case MQTT_EVENT_DATA:
@@ -149,11 +153,37 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             int new_val = atoi(data_buf);
             if (new_val >= 0 && new_val <= 100)
             {
-                g_pump_threshold = new_val;
-                save_calibration("threshold", (int32_t)g_pump_threshold);
+                if (new_val != g_pump_threshold) {
+                    g_pump_threshold = new_val;
+                    save_calibration("threshold", g_pump_threshold);
+                }
                 ESP_LOGW(TAG, "MQTT: g_pump_threshold auf %d gesetzt", g_pump_threshold);
             }
         }
+        // --- Pumpe ON/OFF Switch ---
+        else if (strncmp(event->topic, "home/plants/basilikum/set_pump_enabled", event->topic_len) == 0)
+        {
+            char data_buf[8];
+            int len = (event->data_len < 7) ? event->data_len : 7;
+            memcpy(data_buf, event->data, len);
+            data_buf[len] = '\0';
+
+            if (data_buf[0] == '1') {
+                g_pump_enabled = true;
+                g_dry_run_alarm = false;
+                ESP_LOGW(TAG, "MQTT: Pumpe AUTOMATIK AKTIVIERT");
+            } else {
+                g_pump_enabled = false;
+                // WICHTIG: Wenn Automatik aus, Pumpe sofort sicherheitshalber stoppen
+                gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF); 
+                ESP_LOGW(TAG, "MQTT: Pumpe AUTOMATIK DEAKTIVIERT");
+            }
+            
+            // Status sofort an HA zurückmelden, damit der Schalter dort synchron bleibt
+            esp_mqtt_client_publish(client, "home/plants/basilikum/state_pump_enabled", 
+                                   g_pump_enabled ? "1" : "0", 0, 1, 1);
+        }
+
         // --- LXH Sync ---
         else if (strncmp(event->topic, MQTT_TOPIC_SYNC_LXH, event->topic_len) == 0)
         {
@@ -281,7 +311,7 @@ void mqtt_publish_data(int tds, float lux, float vpd, float moisture, float lxh,
     
     char payload[256]; // Buffer auf 256 erhöht, da das JSON länger wird
     snprintf(payload, sizeof(payload),
-             "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %d, \"lxh\": %.1f, \"fert_alarm\": %d, \"dry_run\": %d}",
+             "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %ld, \"lxh\": %.1f, \"fert_alarm\": %d, \"dry_run\": %d}",
              tds, lux, vpd, moisture, g_pump_threshold, lxh, (fert_alarm ? 1 : 0), (dry_run_alarm ? 1 : 0));
 
     esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", payload, 0, 1, 0);
@@ -405,9 +435,6 @@ void update_light_logic(float current_lux)
         ESP_LOGW(TAG, "Mitternacht! lxH Reset (von %.1f auf 0).", g_lxh_total);
         g_lxh_total = 0;
         g_last_day = timeinfo.tm_mday; // Neuen Tag merken
-
-        // Sofort an HA schicken, damit der Speicher dort auch auf 0 geht
-        mqtt_publish_data(0, current_lux, 0, 0, g_lxh_total, false, false);
     }
 }
 
@@ -416,7 +443,7 @@ void setup_relay()
 {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PUMP_RELAY_GPIO),
-        .mode = GPIO_MODE_OUTPUT_OD,
+        .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -505,6 +532,11 @@ int get_dynamic_threshold(int threshold, float vpd)
 
 void control_pump(bool threshold, float current_moisture)
 {
+    // Boot-Schutz (30 Sekunden warten damit linar percent sich aufbauen kann)
+    if (xTaskGetTickCount() * portTICK_PERIOD_MS < 30000) {
+        return; 
+    }
+
     if (!g_pump_enabled)
     {
         gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
@@ -527,7 +559,7 @@ void control_pump(bool threshold, float current_moisture)
                 gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
                 state = 1;
                 next_action_time = now + PUMP_DURATION_MS;
-                ESP_LOGI(TAG, "Gießversuch gestartet (Versuch %d/3). Feuchte: %.1f%%", retry_count + 1, moisture_at_start);
+                ESP_LOGI(TAG, "Gießversuch gestartet (Versuch %d/2). Feuchte: %.1f%%", retry_count + 1, moisture_at_start);
             }
             break;
 
@@ -541,12 +573,19 @@ void control_pump(bool threshold, float current_moisture)
             if (current_moisture < (moisture_at_start + 0.5f)) {
                 // Zähler hoch
                 retry_count++;
-                ESP_LOGW(TAG, "Keine Feuchtigkeitsänderung erkannt (%d/3)", retry_count);
+                ESP_LOGW(TAG, "Keine Feuchtigkeitsänderung erkannt (%d/2)", retry_count);
                 
-                if (retry_count >= 3) {
+                if (retry_count >= 2) {
                     g_dry_run_alarm = true;
-                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM nach 3 Versuchen !!!");
+                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM nach 2 Versuchen !!!");
                     g_pump_enabled = false; // Pumpe komplett sperren
+
+                    // --- NUR HIER EINMALIG SENDEN ---
+                    if (mqtt_initialized) {
+                        esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/state_pump_enabled", "0", 0, 1, 1);
+                        esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", "{\"dry_run\": 1}", 0, 1, 0);
+                    }   
+                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM: HA Switch auf OFF gesetzt !!!");
                 }
             } else {
                 // Zähler zurücksetzen
@@ -558,6 +597,7 @@ void control_pump(bool threshold, float current_moisture)
             break;
     }
 }
+
 bool fertilizer_alarm(float tdsValue, float moisture)
 {
     if (tdsValue > 50 && moisture > 20.0)
@@ -622,9 +662,9 @@ void app_main(void)
     bh1750_set_measure_mode(bh1750_dev, BH1750_CONTINUE_1LX_RES);
 
     // SSD1306 Init
-    ssd1306_dev._address = 0x3C;
-    ssd1306_init(&ssd1306_dev, 128, 64);
-    ssd1306_clear_screen(&ssd1306_dev, false);
+    //ssd1306_dev._address = 0x3C;
+    //ssd1306_init(&ssd1306_dev, 128, 64);
+    //ssd1306_clear_screen(&ssd1306_dev, false);
 
     // Menu state
     typedef enum
@@ -770,7 +810,7 @@ void app_main(void)
 
         // ---------------------- MQTT SEND ----------------------------------
         static int mqtt_timer = 0;
-        if (mqtt_timer++ >= 20)
+        if (mqtt_timer++ >= 600)
         {
             mqtt_publish_data(tds, lux, vpd, linear_wet, g_lxh_total, fertilizer_alarm(tds, linear_wet), g_dry_run_alarm);
             mqtt_timer = 0;
