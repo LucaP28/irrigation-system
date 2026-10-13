@@ -9,7 +9,6 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "bh1750.h"
-#include "ssd1306.h"
 #include "driver/gpio.h"
 #include "dht.h"
 #include <time.h>
@@ -19,6 +18,7 @@
 #include "mqtt_client.h"
 #include "esp_netif.h"
 #include "esp_sntp.h"
+#include "esp_sleep.h"
 #include "secrets.h"
 
 static esp_mqtt_client_handle_t mqtt_client;
@@ -29,10 +29,8 @@ static esp_mqtt_client_handle_t mqtt_client;
 #define RELAY_TRIGGER 0 // 1 = High-Level-Trigger : 0 = Low-Level-Trigger
 #define RELAY_OFF 1     // 0 = High-Level-Trigger : 1 = Low-Level-Trigger
 #define PUMP_RELAY_GPIO 32
-#define PUMP_DURATION_MS 4000 // 4 Sekunden gießen
-#define PUMP_WAIT_MS 240000    // 240 Sekunden warten
+#define PUMP_DURATION_MS 10000 // 10 Sekunden gießen
 
-#define BUTTON_GPIO 4
 #define I2C_MASTER_SCL_IO 22
 #define I2C_MASTER_SDA_IO 21
 #define I2C_MASTER_NUM I2C_NUM_0
@@ -46,18 +44,21 @@ static esp_mqtt_client_handle_t mqtt_client;
 static RTC_DATA_ATTR float g_lxh_total = 0;     // Licht-Summe
 static RTC_DATA_ATTR long g_last_timestamp = 0; // Letzter Messzeitpunkt
 static RTC_DATA_ATTR int g_last_day = -1;       // Zur Erkennung des Datumswechsels
-static RTC_DATA_ATTR bool g_dry_run_alarm = false;            // Alarm wenn Wasser fehlt oder Pumpe defekt
+static RTC_DATA_ATTR bool g_dry_run_alarm = false;    // Alarm wenn Wasser fehlt oder Pumpe defekt
+static RTC_DATA_ATTR int g_retry_count = 0;           // Zähler für erfolglose Gießversuche
+static RTC_DATA_ATTR float g_moisture_at_start = 0.0; // Feuchtigkeit vor dem Gießen
+static RTC_DATA_ATTR bool g_is_soaking = false;       // State ob gerade in der Sickerpause nach dem Gießen
 
 static bool g_lxh_synced = false;               // Die gesammelten Lux/h von homeassitant ziehen, bei strom ausfall
 #define MQTT_TOPIC_SYNC_LXH "home/plants/basilikum/sync_lxh"
 
 static const char *TAG = "PLANT_MONITOR";
-SSD1306_t ssd1306_dev;
 bh1750_handle_t bh1750_dev;
 adc_oneshot_unit_handle_t adc1_handle;
 static bool mqtt_initialized = false;
 static time_t last_sntp_request = 0;
 static bool time_is_synchronized = false;
+int g_last_raw_soil = 0;
 
 // Globale Grenzwerte
 int32_t g_dry_val = 2300;
@@ -139,6 +140,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // get pump state retained from HA
         esp_mqtt_client_publish(client, "home/plants/basilikum/state_pump_enabled", 
                        g_pump_enabled ? "1" : "0", 0, 1, 1);
+        
+        // NEU: Fordere den Tages-Lichtwert an, sobald wir verbunden sind
+        esp_mqtt_client_publish(client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
         break;
 
     case MQTT_EVENT_DATA:
@@ -302,7 +306,7 @@ void wifi_init(void)
     esp_wifi_start();
 }
 
-void mqtt_publish_data(int tds, float lux, float vpd, float moisture, float lxh, bool fert_alarm, bool dry_run_alarm)
+void mqtt_publish_data(float lux, float vpd, float moisture, float lxh, bool dry_run_alarm)
 {   
     // wartet den ersten light sync von homeassistant ab, bis es was senden darf
     if (!mqtt_initialized || !g_lxh_synced) {
@@ -311,11 +315,32 @@ void mqtt_publish_data(int tds, float lux, float vpd, float moisture, float lxh,
     
     char payload[256]; // Buffer auf 256 erhöht, da das JSON länger wird
     snprintf(payload, sizeof(payload),
-             "{\"tds\": %d, \"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %ld, \"lxh\": %.1f, \"fert_alarm\": %d, \"dry_run\": %d}",
-             tds, lux, vpd, moisture, g_pump_threshold, lxh, (fert_alarm ? 1 : 0), (dry_run_alarm ? 1 : 0));
+             "{\"lux\": %.0f, \"vpd\": %.2f, \"moisture\": %.1f, \"threshold\": %ld, \"lxh\": %.1f, \"dry_run\": %d}",
+             lux, vpd, moisture, g_pump_threshold, lxh, (dry_run_alarm ? 1 : 0));
 
     esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", payload, 0, 1, 0);
     ESP_LOGI(TAG, "MQTT Sent: %s", payload);
+}
+
+void mqtt_publish_debug_data(float temp, float hum, float lux, float linear_wet, float vpd)
+{   
+    if (!mqtt_initialized) {
+        return; 
+    }
+    
+    char payload[512]; 
+    snprintf(payload, sizeof(payload), 
+             "{\"raw_soil\": %d, \"wet_val\": %ld, \"dry_val\": %ld, \"temp\": %.1f, \"hum\": %.1f, "
+             "\"lux\": %.0f, \"linear_wet\": %.1f, \"vpd\": %.2f, \"lxh_total\": %.1f, "
+             "\"pump_enabled\": %d, \"threshold\": %ld, \"dry_run_alarm\": %d, "
+             "\"retry_count\": %d, \"is_soaking\": %d}",
+             g_last_raw_soil, g_wet_val, g_dry_val, temp, hum, 
+             lux, linear_wet, vpd, g_lxh_total, 
+             g_pump_enabled ? 1 : 0, g_pump_threshold, g_dry_run_alarm ? 1 : 0, 
+             g_retry_count, g_is_soaking ? 1 : 0);
+
+    esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/debug", payload, 0, 1, 0);
+    ESP_LOGI(TAG, "MQTT Debug Sent: %s", payload);
 }
 
 // --- TIME FUNKTIONEN ---
@@ -346,18 +371,12 @@ void manage_sntp_sync()
     // nutzt 1000000000 (Jahr 2001), da der Server 2004 liefert.
     bool current_sync_status = (now > 1000000000);
 
-    // --- LOGGING & SYNC TRIGGER ---
+    // --- LOGGING ---
     if (current_sync_status != time_is_synchronized)
     {
         if (current_sync_status)
         {
             ESP_LOGW(TAG, ">>> Zeit erfolgreich synchronisiert! (Unix: %ld)", now);
-            
-            // Sobald die Zeit da ist, fordert den Lux-Wert aktiv an, falls wir noch nicht synchronisiert sind.
-            if (!g_lxh_synced && mqtt_initialized) {
-                ESP_LOGW(TAG, "Zeit steht bereit. Fordere lxH Sync von HA an...");
-                esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
-            }
         }
         else
         {
@@ -452,15 +471,6 @@ void setup_relay()
     gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
 }
 
-void setup_button()
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE};
-    gpio_config(&io_conf);
-}
-
 void setup_soil_sensor()
 {
     adc_oneshot_unit_init_cfg_t init_cfg = {.unit_id = ADC_UNIT_1};
@@ -469,44 +479,57 @@ void setup_soil_sensor()
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12};
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &config)); // soil sensor gpio 34
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_7, &config)); // tds sensor gpio 35
 }
 
-int read_soil_moisture()
+float get_smoothed_moisture()
 {
-    int val;
-    adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &val);
-    return val;
-}
+    // 1. Dem Sensor kurz Zeit geben, sein Feld aufzubauen
+    vTaskDelay(pdMS_TO_TICKS(500)); 
 
-int read_tds_raw()
-{
-    int val;
-    adc_oneshot_read(adc1_handle, ADC_CHANNEL_7, &val);
-    return val;
-}
+    // 2. Dummy-Reads (Kondensator aufladen)
+    int dummy;
+    for(int i = 0; i < 10; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &dummy);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
-float get_tds_value(int raw_adc, float air_temp)
-{
-    // Das Wasser im Untertopf ist ca. 3°C kühler als die Luft
-    float water_temp = air_temp - 3.0f;
+    // 3. 10 echte Werte in ein Array einlesen
+    int readings[10];
+    for(int i = 0; i < 10; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &readings[i]);
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+    }
+    
+    // 4. Array sortieren (Bubble Sort)
+    for (int i = 0; i < 9; i++) {
+        for (int j = 0; j < 9 - i; j++) {
+            if (readings[j] > readings[j + 1]) {
+                int temp = readings[j];
+                readings[j] = readings[j + 1];
+                readings[j + 1] = temp;
+            }
+        }
+    }
+    
+    // 5. Die 2 niedrigsten und 2 höchsten Ausreißer ignorieren (gestutztes Mittel)
+    int sum = 0;
+    for (int i = 2; i < 8; i++) {
+        sum += readings[i];
+    }
+    int raw_soil = sum / 6;
+    g_last_raw_soil = raw_soil;  //debug value
 
-    // Spannung berechnen (ESP32: 3.3V / 12 bit)
-    float voltage = raw_adc * (3.3f / 4095.0f);
-
-    // Temperatur-Korrektur auf Basis der Wassertemperatur
-    float compensationCoefficient = 1.0 + 0.02 * (water_temp - 25.0);
-    float compensationVoltage = voltage / compensationCoefficient;
-
-    /*
-    TDS Polynom
-    Konvertiert Spannung in TDS (ppm).
-    Die Koeffizienten basieren auf einer empirischen Polynom-Regression 3. Grades
-    Standardmodell für kostengünstige Leitfähigkeitssensoren.
-    Modell-Gleichung: y = 133.42x^3 - 255.86x^2 + 857.39x
-    */
-    float tdsValue = (133.42 * pow(compensationVoltage, 3) - 255.86 * pow(compensationVoltage, 2) + 857.39 * compensationVoltage) * 0.5;
-    return tdsValue;
+    // 6. Normale Prozentrechnung
+    float percent = 0.0;
+    if (g_dry_val != g_wet_val)
+    {
+        percent = (float)(g_dry_val - raw_soil) * 100.0 / (float)(g_dry_val - g_wet_val);
+    }
+    
+    if (percent < 0) return 0.0;
+    if (percent > 100) return 100.0;
+    
+    return percent;
 }
 
 // --- VPD BERECHNUNG ---
@@ -530,96 +553,61 @@ int get_dynamic_threshold(int threshold, float vpd)
     return vpd_threshold;
 }
 
-void control_pump(bool threshold, float current_moisture)
+void control_pump(bool is_too_dry, float current_moisture)
 {
-    // Boot-Schutz (30 Sekunden warten damit linar percent sich aufbauen kann)
-    if (xTaskGetTickCount() * portTICK_PERIOD_MS < 30000) {
-        return; 
-    }
-
     if (!g_pump_enabled)
     {
         gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
         return;
     }
 
-    static uint32_t next_action_time = 0;
-    static int state = 0;
-    static float moisture_at_start = 0.0;
-    static int retry_count = 0; // Zähler für erfolglose Gießversuche
-    
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // 1. Wurde gegossen?
+    if (g_is_soaking) {
+        if (current_moisture < (g_moisture_at_start + 0.5f)) {
+            g_retry_count++;
+            ESP_LOGW(TAG, "Keine Feuchtigkeitsänderung nach Schlaf (%d/2)", g_retry_count);
+            
+            if (g_retry_count >= 2) {
+                g_dry_run_alarm = true;
+                g_pump_enabled = false; // Pumpe komplett sperren
+                ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM !!!");
 
-    if (now < next_action_time) return;
-
-    switch (state) {
-        case 0: // Warten
-            if (threshold) {
-                moisture_at_start = current_moisture;
-                gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
-                state = 1;
-                next_action_time = now + PUMP_DURATION_MS;
-                ESP_LOGI(TAG, "Gießversuch gestartet (Versuch %d/2). Feuchte: %.1f%%", retry_count + 1, moisture_at_start);
-            }
-            break;
-
-        case 1: // Gießen beendet
-            gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
-            state = 2;
-            next_action_time = now + PUMP_WAIT_MS; // Sickerpause
-            break;
-
-        case 2: // Erfolgskontrolle nach Sickerpause
-            if (current_moisture < (moisture_at_start + 0.5f)) {
-                // Zähler hoch
-                retry_count++;
-                ESP_LOGW(TAG, "Keine Feuchtigkeitsänderung erkannt (%d/2)", retry_count);
-                
-                if (retry_count >= 2) {
-                    g_dry_run_alarm = true;
-                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM nach 2 Versuchen !!!");
-                    g_pump_enabled = false; // Pumpe komplett sperren
-
-                    // --- NUR HIER EINMALIG SENDEN ---
-                    if (mqtt_initialized) {
-                        esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/state_pump_enabled", "0", 0, 1, 1);
-                        esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", "{\"dry_run\": 1}", 0, 1, 0);
-                    }   
-                    ESP_LOGE(TAG, "!!! TROCKENLAUF-ALARM: HA Switch auf OFF gesetzt !!!");
+                if (mqtt_initialized) {
+                    // Update den Status für das Dashboard
+                    esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/state_pump_enabled", "0", 0, 1, 1);
+                    
+                    // NEU: Überschreibe den Retain-Befehl auf dem Broker!
+                    // Nimmt HA den Befehl weg, die Automatik beim nächsten Start wieder einzuschalten.
+                    esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum/set_pump_enabled", "0", 0, 1, 1);
+                    
+                    esp_mqtt_client_publish(mqtt_client, "home/plants/basilikum", "{\"dry_run\": 1}", 0, 1, 0);
                 }
-            } else {
-                // Zähler zurücksetzen
-                retry_count = 0;
-                g_dry_run_alarm = false;
-                ESP_LOGI(TAG, "Gießen erfolgreich. Zähler zurückgesetzt.");
             }
-            state = 0;
-            break;
+        } else {
+            g_retry_count = 0;
+            g_dry_run_alarm = false;
+            ESP_LOGI(TAG, "Gießen erfolgreich. Zähler zurückgesetzt.");
+        }
+        g_is_soaking = false; // Sickerpause beendet
+    }
+
+    // 2. Gießen, falls nötig (und kein Alarm anliegt)
+    if (is_too_dry && !g_dry_run_alarm) {
+        ESP_LOGI(TAG, "Gießvorgang gestartet...");
+        g_moisture_at_start = current_moisture;
+        
+        // Pumpe AN
+        gpio_set_level(PUMP_RELAY_GPIO, RELAY_TRIGGER);
+        vTaskDelay(pdMS_TO_TICKS(PUMP_DURATION_MS));
+        
+        // Pumpe AUS
+        gpio_set_level(PUMP_RELAY_GPIO, RELAY_OFF);
+        
+        // Merken, dass wir gegossen haben, damit der nächste Wakeup kontrolliert
+        g_is_soaking = true; 
     }
 }
 
-bool fertilizer_alarm(float tdsValue, float moisture)
-{
-    if (tdsValue > 50 && moisture > 20.0)
-    {
-        if (tdsValue < 500)
-        {
-            // Sensor hat Kontakt, aber wenig Ionen
-            ssd1306_display_text(&ssd1306_dev, 6, "DUEGNER FEHLT!", 14, true); // MQTT BROKER
-            return true;
-        }
-        else
-        {
-            // TDS Sensor hat Kontakt und genug Ionen
-            return false;
-        }
-    }
-    else
-    {
-        // TDS Sensor ist trocken oder Wasser ist noch nicht unten angekommen
-        return false;
-    }
-}
 
 // --------------------------- Main -----------------------------
 void app_main(void)
@@ -634,7 +622,6 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     load_calibration();
-    setup_button();
     setup_soil_sensor();
     setup_relay();
 
@@ -661,234 +648,77 @@ void app_main(void)
     bh1750_dev = bh1750_create(I2C_MASTER_NUM, BH1750_I2C_ADDRESS_DEFAULT);
     bh1750_set_measure_mode(bh1750_dev, BH1750_CONTINUE_1LX_RES);
 
-    // SSD1306 Init
-    //ssd1306_dev._address = 0x3C;
-    //ssd1306_init(&ssd1306_dev, 128, 64);
-    //ssd1306_clear_screen(&ssd1306_dev, false);
-
-    // Menu state
-    typedef enum
-    {
-        STATE_MONITOR,
-        STATE_CAL_DRY,
-        STATE_CAL_WET,
-        STATE_PUMP_TOGGLE,
-        STATE_CAL_EXIT
-    } system_state_t;
-
-    system_state_t current_state = STATE_MONITOR;
-    int hold_time = 0;
-
-    // Boden feuchtigkeit linear interpolation
-    float linear_wet = 0.0;
-
     // Luftfeuchtigkeit global
     float hum = 0;
     float temp = 0;
-    static int dht_timer = 0;
-
     vTaskDelay(pdMS_TO_TICKS(2000)); // 2 Sekunden warten, bis alle Sensoren stabil sind
 
-    // ------------------------- WHILE LOOP -----------------------------------
+// ------------------------- LINEARER ABLAUF (Offline-Fähig) -------------------------
 
-    while (1)
-    {
-        // --- Time Sync ---
-        manage_sntp_sync();
-
-        // ---------------------- Button Logik -----------------------------------
-        int button_level = gpio_get_level(BUTTON_GPIO);
-
-        if (button_level == 0)
-        {
-            hold_time++;
-        }
-        else
-        {
-            // Kurz drücken: Menü umschalten
-            if (hold_time > 1 && hold_time <= 15)
-            {
-                if (current_state == STATE_MONITOR)
-                {
-                    current_state = STATE_CAL_DRY;
-                }
-                else
-                {
-                    // Schaltet jetzt durch DRY -> WET -> PUMP_TOGGLE -> EXIT
-                    current_state = (current_state == STATE_CAL_EXIT) ? STATE_CAL_DRY : (current_state + 1);
-                }
-                ssd1306_clear_screen(&ssd1306_dev, false);
-            }
-            hold_time = 0;
-        }
-
-        // --------------------- BUTTON HOLD LOGIK --------------------------
-        if (hold_time > 12)
-        {
-            bool state_changed = false;
-
-            if (current_state == STATE_CAL_DRY)
-            {
-                g_dry_val = read_soil_moisture();
-                save_calibration("dry", g_dry_val);
-                ssd1306_display_text(&ssd1306_dev, 6, "SAVED DRY!", 10, true);
-                state_changed = true;
-            }
-            else if (current_state == STATE_CAL_WET)
-            {
-                g_wet_val = read_soil_moisture();
-                save_calibration("wet", g_wet_val);
-                ssd1306_display_text(&ssd1306_dev, 6, "SAVED NASS!", 11, true);
-                state_changed = true;
-            }
-            else if (current_state == STATE_PUMP_TOGGLE)
-            {
-                g_pump_enabled = !g_pump_enabled; // Umschalten
-                g_dry_run_alarm = false;          // Alarm im HA aus machen
-                char *msg = g_pump_enabled ? "PUMPE AN!" : "PUMPE AUS!";
-                ssd1306_display_text(&ssd1306_dev, 6, msg, strlen(msg), true);
-                state_changed = true;
-            }
-            else if (current_state == STATE_CAL_EXIT)
-            {
-                char *msg = "EXIT!";
-                ssd1306_display_text(&ssd1306_dev, 6, msg, strlen(msg), true);
-                state_changed = true;
-            }
-
-            if (state_changed)
-            {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                current_state = STATE_MONITOR;
-                ssd1306_clear_screen(&ssd1306_dev, false);
-                hold_time = 0;
-            }
-        }
-
-        // ----------------------- SENSOR MESSUNG ------------------------------------
-        // Sensor auslesen DHT_TYPE_DHT22
-        if (dht_timer++ >= 20)
-        { // Nur Alle 2 Sekunden sonst wird der sensor zu heiß
-            dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
-            dht_timer = 0;
-        }
-
-        // Bodenfeuchtigkeit berechnen
-        int raw_soil = read_soil_moisture();
-        float percent = 0.0;
-
-        if (g_dry_val != g_wet_val)
-        {
-            percent = (float)(g_dry_val - raw_soil) * 100.0 / (float)(g_dry_val - g_wet_val);
-        }
-        if (percent < 0)
-            percent = 0;
-        if (percent > 100)
-            percent = 100;
-
-        // TDS auswerten
-        int raw_tds = read_tds_raw();
-        int tds = get_tds_value(raw_tds, temp);
-
-        // Glättung des Werts
-        linear_wet = (linear_wet * 0.9) + (percent * 0.1);
-
-        // VPD und Alarm berechnen
-        float vpd = calculate_VPD(temp, hum);
-        int current_target = get_dynamic_threshold(g_pump_threshold, vpd);
-        bool is_too_dry = (linear_wet < current_target); // returns true if its to dry in relation to humidity
-
-        // Pumpe steuern
-        control_pump(is_too_dry, linear_wet);
-
-        // Licht auslesen
-        float lux = 0;
-        bh1750_get_data(bh1750_dev, &lux);
-
-        // Update lux time
-        update_light_logic(lux);
-
-        // ---------------------- MQTT SEND ----------------------------------
-        static int mqtt_timer = 0;
-        if (mqtt_timer++ >= 600)
-        {
-            mqtt_publish_data(tds, lux, vpd, linear_wet, g_lxh_total, fertilizer_alarm(tds, linear_wet), g_dry_run_alarm);
-            mqtt_timer = 0;
-        }
-
-        // --------------------- DISPLAY AUSGABE -----------------------------
-        if (current_state == STATE_MONITOR)
-        {
-
-            // Text-Strings bauen
-            char l_str[24], s_str[24], dht_str[24], vpd_str[24], tds_str[24], l_sum_str[24];
-            ;
-            sprintf(l_str, "Licht:  %.0f lx   ", lux);
-            sprintf(s_str, "Boden:    %.1f%%   ", linear_wet);
-            sprintf(dht_str, "Luft:  %.1fC %.0f%%   ", temp, hum);
-            sprintf(vpd_str, "VPD:    %.2f kPa   ", vpd);
-            sprintf(tds_str, "TDS:    %i ppm   ", tds);
-            sprintf(l_sum_str, "Sonne:  %.0f lx/H", g_lxh_total);
-
-            // 5. Display Ausgabe (Zeile 0 bis 7)
-            // ssd1306_display_text(&ssd1306_dev, 0, "PFLANZEN-MONITOR", 16, false);
-            ssd1306_display_text(&ssd1306_dev, 0, l_str, strlen(l_str), false);
-            ssd1306_display_text(&ssd1306_dev, 1, s_str, strlen(s_str), false);
-            ssd1306_display_text(&ssd1306_dev, 2, dht_str, strlen(dht_str), false);
-            ssd1306_display_text(&ssd1306_dev, 3, vpd_str, strlen(vpd_str), false);
-            ssd1306_display_text(&ssd1306_dev, 4, tds_str, strlen(tds_str), false);
-            ssd1306_display_text(&ssd1306_dev, 5, l_sum_str, strlen(l_sum_str), false);
-
-            // Alarm-Status. Invertiert, wenn "GIESSEN!" drinsteht.
-            char *display_status = is_too_dry ? "GIESSEN!     " : "ALLES GUT     ";
-            if (vpd > 1.5 && is_too_dry)
-            {
-                display_status = "TO DRY (VPD!)";
-            }
-            // Display Alarm
-            ssd1306_display_text(&ssd1306_dev, 7, display_status, strlen(display_status), !(is_too_dry && g_pump_enabled));
-        }
-        else // --- SETUP MENÜ ---
-        {
-            ssd1306_display_text(&ssd1306_dev, 0, "---- SETUP ----", 13, false);
-
-            char raw_str[24];
-            sprintf(raw_str, "RAW: %d      ", read_soil_moisture());
-
-            // Hier wird jetzt jeder Status korrekt angezeigt
-            if (current_state == STATE_CAL_DRY)
-            {
-                ssd1306_display_text(&ssd1306_dev, 2, "> Set: TROCKEN   ", 15, false);
-                ssd1306_display_text(&ssd1306_dev, 4, raw_str, strlen(raw_str), false);
-            }
-            else if (current_state == STATE_CAL_WET)
-            {
-                ssd1306_display_text(&ssd1306_dev, 2, "> Set: NASS      ", 15, false);
-                ssd1306_display_text(&ssd1306_dev, 4, raw_str, strlen(raw_str), false);
-            }
-            else if (current_state == STATE_PUMP_TOGGLE)
-            {
-                // NEU: Zeigt an, ob die Pumpe gerade aktiviert ist oder nicht
-                char p_str[24];
-                sprintf(p_str, "> PUMPE: %s   ", g_pump_enabled ? "AN " : "AUS");
-                ssd1306_display_text(&ssd1306_dev, 2, p_str, strlen(p_str), false);
-            }
-            else if (current_state == STATE_CAL_EXIT)
-            {
-                ssd1306_display_text(&ssd1306_dev, 2, "> ZURUECK       ", 15, false);
-            }
-
-            // Fortschrittsanzeige beim Halten (unverändert)
-            if (hold_time > 9)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion...  ", 15, false);
-            else if (hold_time > 6)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion..   ", 15, false);
-            else if (hold_time > 3)
-                ssd1306_display_text(&ssd1306_dev, 6, "HOLD: Aktion.    ", 15, false);
-            else
-                ssd1306_display_text(&ssd1306_dev, 6, "Click: Weiter    ", 15, false);
-        }
-
+    // 1. Warten auf WLAN, Zeit und MQTT-Sync (Maximal 25 Sekunden)
+    ESP_LOGI(TAG, "Warte auf WLAN und Zeit-Sync...");
+    int wait_timeout = 0;
+    
+    while ((!mqtt_initialized || !g_lxh_synced) && wait_timeout < 250) {
+        manage_sntp_sync(); 
         vTaskDelay(pdMS_TO_TICKS(100));
+        wait_timeout++;
     }
+
+    // 2. Sensoren auslesen (Wird IMMER ausgeführt, auch ohne WLAN)
+    if (wait_timeout >= 250) {
+        ESP_LOGE(TAG, "Timeout! Kein WLAN/Sync. Führe Notfall-Messung offline aus...");
+    } else {
+        ESP_LOGI(TAG, "System bereit! Führe Messungen durch...");
+    }
+
+    dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
+    
+    float linear_wet = get_smoothed_moisture();
+    float vpd = calculate_VPD(temp, hum);
+    int current_target = get_dynamic_threshold(g_pump_threshold, vpd);
+    bool is_too_dry = (linear_wet < current_target);
+
+    // 3. Pumpen-Logik (Prüft Sickerpause und gießt ggf.)
+    control_pump(is_too_dry, linear_wet);
+
+    // 4. Licht auslesen & Daten senden (Nur wenn WLAN da ist)
+    float lux = 0;
+    bh1750_get_data(bh1750_dev, &lux);
+
+    if (wait_timeout < 250) {
+        update_light_logic(lux);
+        mqtt_publish_data(lux, vpd, linear_wet, g_lxh_total, g_dry_run_alarm);
+        mqtt_publish_debug_data(temp, hum, lux, linear_wet, vpd);
+    }
+
+    // 5. Debug Dump (IMMER ausgeben, auch offline wichtig zur Fehleranalyse)
+    ESP_LOGI(TAG, "================ DEBUG DUMP ================");
+    ESP_LOGI(TAG, "Sensoren Rohwerte:");
+    ESP_LOGI(TAG, " - ADC Feuchtigkeit : %d (Kalibrierung -> Nass: %ld, Trocken: %ld)", g_last_raw_soil, g_wet_val, g_dry_val);
+    ESP_LOGI(TAG, " - Temperatur       : %.1f °C", temp); 
+    ESP_LOGI(TAG, " - Luftfeuchtigkeit : %.1f %%", hum);  
+    ESP_LOGI(TAG, " - Licht (aktuell)  : %.0f Lux", lux);
+    ESP_LOGI(TAG, "Berechnete Logik:");
+    ESP_LOGI(TAG, " - Boden-Prozent    : %.1f %%", linear_wet);
+    ESP_LOGI(TAG, " - VPD              : %.2f kPa", vpd);
+    ESP_LOGI(TAG, " - Lichtsumme (lxH) : %.1f", g_lxh_total);
+    ESP_LOGI(TAG, "System Status:");
+    ESP_LOGI(TAG, " - Pumpe Automatik  : %s", g_pump_enabled ? "AN" : "AUS");
+    ESP_LOGI(TAG, " - Schwellenwert    : %ld %%", g_pump_threshold);
+    ESP_LOGI(TAG, " - Trockenlauf-Alarm: %s", g_dry_run_alarm ? "AKTIV" : "OK");
+    ESP_LOGI(TAG, " - Retry-Zähler     : %d/2", g_retry_count);
+    ESP_LOGI(TAG, " - Sickerpause      : %s", g_is_soaking ? "JA" : "NEIN");
+    ESP_LOGI(TAG, "============================================");
+
+    // 6. Dem ESP kurz Zeit geben, das MQTT-Paket auch wirklich zu senden (wenn online)
+    if (wait_timeout < 250) {
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
+    }
+
+    // ------------------------- GUTE NACHT -------------------------
+    ESP_LOGI(TAG, "Gehe in den Deep Sleep für 5 Minuten...");
+    esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL); 
+    esp_wifi_stop(); 
+    esp_deep_sleep_start();
 }
