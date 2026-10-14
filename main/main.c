@@ -48,6 +48,7 @@ static RTC_DATA_ATTR bool g_dry_run_alarm = false;    // Alarm wenn Wasser fehlt
 static RTC_DATA_ATTR int g_retry_count = 0;           // Zähler für erfolglose Gießversuche
 static RTC_DATA_ATTR float g_moisture_at_start = 0.0; // Feuchtigkeit vor dem Gießen
 static RTC_DATA_ATTR bool g_is_soaking = false;       // State ob gerade in der Sickerpause nach dem Gießen
+static RTC_DATA_ATTR bool g_pump_enabled = false;     // Ob die Pumpe überhaupt aktiviert ist (MQTT Schalter)
 
 static bool g_lxh_synced = false;               // Die gesammelten Lux/h von homeassitant ziehen, bei strom ausfall
 #define MQTT_TOPIC_SYNC_LXH "home/plants/basilikum/sync_lxh"
@@ -64,7 +65,8 @@ int g_last_raw_soil = 0;
 int32_t g_dry_val = 2300;
 int32_t g_wet_val = 400;
 int32_t g_pump_threshold = 50; // Hardcoded Startwert (50%)
-bool g_pump_enabled = false;
+int32_t g_sleep_minutes = 5; // Standardwert 5 Minuten
+
 
 // --- NVS FUNKTIONEN ---
 /*
@@ -118,8 +120,9 @@ void load_calibration()
         nvs_get_i32(my_handle, "dry", &g_dry_val);
         nvs_get_i32(my_handle, "wet", &g_wet_val);
         nvs_get_i32(my_handle, "threshold", &g_pump_threshold);
+        nvs_get_i32(my_handle, "sleep_min", &g_sleep_minutes); // <--- NEU
         nvs_close(my_handle);
-        ESP_LOGI(TAG, "Geladen: Dry=%ld, Wet=%ld, Pump-Threshold=%ld", g_dry_val, g_wet_val, g_pump_threshold);
+        ESP_LOGI(TAG, "Geladen: Dry=%ld, Wet=%ld, Pump=%ld, Sleep=%ldm", g_dry_val, g_wet_val, g_pump_threshold, g_sleep_minutes);
     }
 }
 
@@ -140,6 +143,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // get pump state retained from HA
         esp_mqtt_client_publish(client, "home/plants/basilikum/state_pump_enabled", 
                        g_pump_enabled ? "1" : "0", 0, 1, 1);
+
+        // NEU: Sleep-Status an HA melden
+        char sleep_buf[8];
+        snprintf(sleep_buf, sizeof(sleep_buf), "%ld", g_sleep_minutes);
+        esp_mqtt_client_publish(client, "home/plants/basilikum/state_sleep", sleep_buf, 0, 1, 1);
         
         // NEU: Fordere den Tages-Lichtwert an, sobald wir verbunden sind
         esp_mqtt_client_publish(client, "home/plants/basilikum/request_sync", "1", 0, 1, 0);
@@ -164,6 +172,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGW(TAG, "MQTT: g_pump_threshold auf %d gesetzt", g_pump_threshold);
             }
         }
+
+        // --- Sleep Timer ---
+        else if (strncmp(event->topic, "home/plants/basilikum/set_sleep", event->topic_len) == 0)
+        {
+            char data_buf[16];
+            int len = (event->data_len < 15) ? event->data_len : 15;
+            memcpy(data_buf, event->data, len);
+            data_buf[len] = '\0';
+
+            int new_val = atoi(data_buf);
+            if (new_val >= 1 && new_val <= 1440) // Begrenzung: 1 Minute bis 24 Stunden
+            {
+                if (new_val != g_sleep_minutes) {
+                    g_sleep_minutes = new_val;
+                    save_calibration("sleep_min", g_sleep_minutes);
+                }
+                ESP_LOGW(TAG, "MQTT: Deep-Sleep auf %ld Minuten gesetzt", g_sleep_minutes);
+                
+                char sleep_buf[8];
+                snprintf(sleep_buf, sizeof(sleep_buf), "%ld", g_sleep_minutes);
+                esp_mqtt_client_publish(client, "home/plants/basilikum/state_sleep", sleep_buf, 0, 1, 1);
+            }
+        }
+
         // --- Pumpe ON/OFF Switch ---
         else if (strncmp(event->topic, "home/plants/basilikum/set_pump_enabled", event->topic_len) == 0)
         {
@@ -204,33 +236,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                 if (sscanf(data_buf, "{\"val\": %f, \"day\": %d}", &restored_val, &restored_day) == 2)
                 {
-                    time_t now;
-                    time(&now);
-
-                    // Prüfe auf valide Zeit (> Jahr 2001), da dein SNTP 2004 liefert
-                    if (now > 1000000000) 
-                    {
-                        struct tm timeinfo;
-                        localtime_r(&now, &timeinfo);
-
-                        if (timeinfo.tm_mday == restored_day)
-                        {
-                            g_lxh_total = restored_val;
-                            g_lxh_synced = true; 
-                            ESP_LOGW(TAG, "Sync: Wert von HEUTE erfolgreich geladen (%.1f)", g_lxh_total);
-                        }
-                        else
-                        {
-                            g_lxh_total = 0;
-                            g_lxh_synced = true;
-                            ESP_LOGW(TAG, "Sync: Paket war von GESTERN (Tag %d, heute %d). Reset auf 0.", restored_day, timeinfo.tm_mday);
-                        }
-                    }
-                    else 
-                    {
-                        // Wartet auf das nächste Paket, damit wir nicht versehentlich 0 speichern.
-                        ESP_LOGI(TAG, "Sync-Paket erhalten, aber SNTP-Zeit noch nicht bereit. Ignoriere...");
-                    }
+                    g_lxh_total = restored_val;
+                    g_last_day = restored_day; // Genialer Trick: Wir gaukeln der Logik vor, es wäre noch dieser Tag
+                    g_lxh_synced = true; 
+                    ESP_LOGW(TAG, "Sync: Wert erfolgreich geladen (%.1f, Tag: %d)", g_lxh_total, g_last_day);
                 }
             }
         }
@@ -608,11 +617,10 @@ void control_pump(bool is_too_dry, float current_moisture)
     }
 }
 
-
 // --------------------------- Main -----------------------------
 void app_main(void)
 {
-    // NVS, Button, Soil Sensor Init
+    // 1. NVS, Button, Soil Sensor Init
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -625,14 +633,7 @@ void app_main(void)
     setup_soil_sensor();
     setup_relay();
 
-    // Networking
-    wifi_init(); // WLAN starten
-
-    // Time print
-    ESP_LOGI(TAG, "\n--- ZEIT-CHECK ---\n");
-    setup_timezone();
-
-    // I2C Init
+    // 2. I2C Init
     i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -648,51 +649,73 @@ void app_main(void)
     bh1750_dev = bh1750_create(I2C_MASTER_NUM, BH1750_I2C_ADDRESS_DEFAULT);
     bh1750_set_measure_mode(bh1750_dev, BH1750_CONTINUE_1LX_RES);
 
-    // Luftfeuchtigkeit global
-    float hum = 0;
-    float temp = 0;
-    vTaskDelay(pdMS_TO_TICKS(2000)); // 2 Sekunden warten, bis alle Sensoren stabil sind
+    // 3. SAUBERE MESSUNG: Sensoren bei stabilem Strom aufwärmen & auslesen
+    ESP_LOGI(TAG, "Lese Sensoren bei stabilem Strom (WLAN ist AUS)...");
+    vTaskDelay(pdMS_TO_TICKS(2000)); 
 
-// ------------------------- LINEARER ABLAUF (Offline-Fähig) -------------------------
-
-    // 1. Warten auf WLAN, Zeit und MQTT-Sync (Maximal 25 Sekunden)
-    ESP_LOGI(TAG, "Warte auf WLAN und Zeit-Sync...");
-    int wait_timeout = 0;
+    float hum = 0, temp = 0, lux = 0;
     
-    while ((!mqtt_initialized || !g_lxh_synced) && wait_timeout < 250) {
-        manage_sntp_sync(); 
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait_timeout++;
+    // --- RETRY LOGIK FÜR DEN DHT SENSOR ---
+    int dht_retries = 0;
+    while (dht_retries < 5) {
+        dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
+        
+        if (hum > 0.0) {
+            ESP_LOGI(TAG, "DHT Messung erfolgreich!");
+            break; // Erfolg! Wir brechen die Retry-Schleife ab.
+        }
+        
+        ESP_LOGW(TAG, "Sensor Messung fehlgeschlagen (Wert 0). Neuer Versuch... (%d/5)", dht_retries + 1);
+        vTaskDelay(pdMS_TO_TICKS(1500)); // 1,5 Sekunden warten vor dem nächsten Versuch
+        dht_retries++;
     }
 
-    // 2. Sensoren auslesen (Wird IMMER ausgeführt, auch ohne WLAN)
-    if (wait_timeout >= 250) {
-        ESP_LOGE(TAG, "Timeout! Kein WLAN/Sync. Führe Notfall-Messung offline aus...");
-    } else {
-        ESP_LOGI(TAG, "System bereit! Führe Messungen durch...");
-    }
+    // Lichtsensor auslesen (0 ist hier nachts normal, daher kein Retry auf 0)
+    bh1750_get_data(bh1750_dev, &lux);
 
-    dht_read_float_data(DHT_TYPE_AM2301, DHT_GPIO, &hum, &temp);
-    
+    // Bodenfeuchtigkeit auslesen & berechnen
     float linear_wet = get_smoothed_moisture();
     float vpd = calculate_VPD(temp, hum);
     int current_target = get_dynamic_threshold(g_pump_threshold, vpd);
     bool is_too_dry = (linear_wet < current_target);
 
-    // 3. Pumpen-Logik (Prüft Sickerpause und gießt ggf.)
+    // 4. JETZT WLAN STARTEN (Die Stromspitze beginnt hier)
+    ESP_LOGI(TAG, "Messungen abgeschlossen. Starte WLAN...");
+    wifi_init(); 
+    
+    ESP_LOGI(TAG, "\n--- ZEIT-CHECK ---\n");
+    setup_timezone();
+
+    // 5. Warten auf WLAN, Zeit und MQTT-Sync (Maximal 25 Sekunden)
+    int wait_timeout = 0;
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    while ((!mqtt_initialized || !g_lxh_synced || timeinfo.tm_year < 120) && wait_timeout < 250) {
+        manage_sntp_sync(); 
+        vTaskDelay(pdMS_TO_TICKS(100));
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        wait_timeout++;
+    }
+
+    if (wait_timeout >= 250) {
+        ESP_LOGE(TAG, "Timeout! Kein WLAN/Sync. Gehe in den Offline-Modus...");
+    }
+
+    // 6. Pumpen-Logik ausführen (Nutzt die sauberen Werte von oben)
     control_pump(is_too_dry, linear_wet);
 
-    // 4. Licht auslesen & Daten senden (Nur wenn WLAN da ist)
-    float lux = 0;
-    bh1750_get_data(bh1750_dev, &lux);
-
+    // 7. Licht-Logik aktualisieren & Daten senden (Nur wenn WLAN da ist)
     if (wait_timeout < 250) {
         update_light_logic(lux);
         mqtt_publish_data(lux, vpd, linear_wet, g_lxh_total, g_dry_run_alarm);
         mqtt_publish_debug_data(temp, hum, lux, linear_wet, vpd);
     }
 
-    // 5. Debug Dump (IMMER ausgeben, auch offline wichtig zur Fehleranalyse)
+    // 8. Debug Dump
     ESP_LOGI(TAG, "================ DEBUG DUMP ================");
     ESP_LOGI(TAG, "Sensoren Rohwerte:");
     ESP_LOGI(TAG, " - ADC Feuchtigkeit : %d (Kalibrierung -> Nass: %ld, Trocken: %ld)", g_last_raw_soil, g_wet_val, g_dry_val);
@@ -711,14 +734,13 @@ void app_main(void)
     ESP_LOGI(TAG, " - Sickerpause      : %s", g_is_soaking ? "JA" : "NEIN");
     ESP_LOGI(TAG, "============================================");
 
-    // 6. Dem ESP kurz Zeit geben, das MQTT-Paket auch wirklich zu senden (wenn online)
     if (wait_timeout < 250) {
         vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
 
-    // ------------------------- GUTE NACHT -------------------------
-    ESP_LOGI(TAG, "Gehe in den Deep Sleep für 5 Minuten...");
-    esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL); 
+    // 9. GUTE NACHT
+    ESP_LOGI(TAG, "Gehe in den Deep Sleep für %ld Minuten...", g_sleep_minutes);
+    esp_sleep_enable_timer_wakeup((uint64_t)g_sleep_minutes * 60ULL * 1000000ULL);
     esp_wifi_stop(); 
     esp_deep_sleep_start();
 }
